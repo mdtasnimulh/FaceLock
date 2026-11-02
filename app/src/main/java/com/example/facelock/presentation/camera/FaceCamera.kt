@@ -4,19 +4,21 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Matrix
+import android.os.SystemClock
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
-import androidx.camera.core.ImageCapture
-import androidx.camera.core.ImageCaptureException
-import androidx.camera.core.ImageProxy
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.view.CameraController
 import androidx.camera.view.LifecycleCameraController
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.Button
+import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -34,41 +36,40 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LocalLifecycleOwner
-import kotlinx.coroutines.suspendCancellableCoroutine
+import com.example.facelock.domain.model.FaceImage
+import com.example.facelock.presentation.components.FaceGlyph
+import com.example.facelock.presentation.components.GradientBackground
+import com.example.facelock.presentation.components.PrimaryButton
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.buffer
+import kotlinx.coroutines.flow.callbackFlow
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 
-/** The front camera plus a suspending "take a photo" that returns an upright, reasonably small bitmap. */
+/** The front camera as a live stream of upright frames. */
 class FaceCameraState internal constructor(
     internal val controller: LifecycleCameraController,
     private val executor: ExecutorService,
 ) {
-    suspend fun capture(): Bitmap = suspendCancellableCoroutine { continuation ->
-        controller.takePicture(executor, object : ImageCapture.OnImageCapturedCallback() {
-            override fun onCaptureSuccess(image: ImageProxy) {
-                val result = runCatching {
-                    image.toBitmap()
-                        .rotated(image.imageInfo.rotationDegrees)
-                        .scaledDown(MAX_SIDE_PX)
-                }
-                image.close()
-                result.fold(
-                    onSuccess = { continuation.resume(it) },
-                    onFailure = { continuation.resumeWithException(it) },
-                )
+    /**
+     * Frames at most every [minIntervalMs]. Collecting starts the analysis, cancelling the
+     * collector stops it. Slow consumers drop old frames instead of building up a queue.
+     */
+    fun frames(minIntervalMs: Long): Flow<FaceImage> = callbackFlow {
+        var lastMs = 0L
+        controller.setImageAnalysisAnalyzer(executor) { proxy ->
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastMs >= minIntervalMs) {
+                lastMs = now
+                val bitmap = runCatching { proxy.toBitmap().rotated(proxy.imageInfo.rotationDegrees) }.getOrNull()
+                if (bitmap != null) trySend(FaceImage(bitmap))
             }
-
-            override fun onError(exception: ImageCaptureException) {
-                continuation.resumeWithException(exception)
-            }
-        })
-    }
-
-    private companion object {
-        const val MAX_SIDE_PX = 1280
-    }
+            proxy.close()
+        }
+        awaitClose { controller.clearImageAnalysisAnalyzer() }
+    }.buffer(Channel.CONFLATED)
 }
 
 @Composable
@@ -79,11 +80,15 @@ fun rememberFaceCameraState(): FaceCameraState {
     val controller = remember {
         LifecycleCameraController(context).apply {
             cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
+            setEnabledUseCases(CameraController.IMAGE_ANALYSIS)
+            imageAnalysisBackpressureStrategy = ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST
+            imageAnalysisOutputImageFormat = ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888
         }
     }
     DisposableEffect(lifecycleOwner) {
         controller.bindToLifecycle(lifecycleOwner)
         onDispose {
+            controller.clearImageAnalysisAnalyzer()
             controller.unbind()
             executor.shutdown()
         }
@@ -123,18 +128,28 @@ fun CameraPermissionGate(content: @Composable () -> Unit) {
     if (granted) {
         content()
     } else {
-        Column(
-            modifier = Modifier.fillMaxSize().padding(32.dp),
-            verticalArrangement = Arrangement.Center,
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            Text(
-                text = "The camera is needed to register and check your face.",
-                style = MaterialTheme.typography.bodyLarge,
-                textAlign = TextAlign.Center,
-            )
-            Button(onClick = { launcher.launch(Manifest.permission.CAMERA) }, modifier = Modifier.padding(top = 16.dp)) {
-                Text("Allow camera")
+        GradientBackground {
+            Column(
+                modifier = Modifier.fillMaxSize().systemBarsPadding().padding(32.dp),
+                verticalArrangement = Arrangement.Center,
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                FaceGlyph()
+                Spacer(Modifier.height(24.dp))
+                Text(
+                    "Camera access needed",
+                    style = MaterialTheme.typography.headlineSmall,
+                    color = MaterialTheme.colorScheme.onBackground,
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "The camera is only used on this device to register and check your face.",
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                )
+                Spacer(Modifier.height(24.dp))
+                PrimaryButton("Allow camera", onClick = { launcher.launch(Manifest.permission.CAMERA) })
             }
         }
     }
@@ -144,11 +159,4 @@ private fun Bitmap.rotated(degrees: Int): Bitmap {
     if (degrees == 0) return this
     val matrix = Matrix().apply { postRotate(degrees.toFloat()) }
     return Bitmap.createBitmap(this, 0, 0, width, height, matrix, true)
-}
-
-private fun Bitmap.scaledDown(maxSide: Int): Bitmap {
-    val longest = maxOf(width, height)
-    if (longest <= maxSide) return this
-    val factor = maxSide.toFloat() / longest
-    return Bitmap.createScaledBitmap(this, (width * factor).toInt(), (height * factor).toInt(), true)
 }

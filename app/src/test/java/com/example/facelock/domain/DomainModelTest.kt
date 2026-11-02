@@ -2,6 +2,7 @@ package com.example.facelock.domain
 
 import com.example.facelock.domain.model.DisplayName
 import com.example.facelock.domain.model.FaceEmbedding
+import com.example.facelock.domain.model.Similarity
 import com.example.facelock.domain.policy.FaceMatchPolicy
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -32,6 +33,13 @@ class DomainModelTest {
         val a = FaceEmbedding.fromRaw(vector(1f, 0.1f))
         val b = FaceEmbedding.fromRaw(vector(1f, 0.2f))
         assertTrue(FaceMatchPolicy.evaluate(a.similarityTo(b)).isMatch)
+    }
+
+    @Test
+    fun loginNeedsEightyPercent() {
+        assertEquals(0.80f, FaceMatchPolicy.MATCH_THRESHOLD, 0f)
+        assertFalse(FaceMatchPolicy.evaluate(Similarity(0.79f)).isMatch)
+        assertTrue(FaceMatchPolicy.evaluate(Similarity(0.80f)).isMatch)
     }
 
     @Test

@@ -3,6 +3,9 @@ package com.example.facelock.data.ml
 import android.content.Context
 import com.example.facelock.domain.model.FaceEmbedding
 import com.example.facelock.domain.model.FaceImage
+import com.example.facelock.domain.model.FrameAnalysis
+import com.example.facelock.domain.model.FrameIssue
+import com.example.facelock.domain.policy.FaceQualityPolicy
 import com.example.facelock.domain.service.FaceLoginException
 import com.example.facelock.domain.service.FaceRecognizer
 import com.google.mlkit.vision.common.InputImage
@@ -16,8 +19,13 @@ import kotlinx.coroutines.withContext
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.math.abs
+import kotlin.math.hypot
 
-/** Face detection (ML Kit) + eye alignment + MobileFaceNet embedding. */
+/**
+ * One camera frame -> [FrameAnalysis]. A frame only becomes an embedding when it passes the same
+ * checks the NID SDK uses before it trusts a face: one face, looking at the camera, eyes open,
+ * big enough, not too close.
+ */
 @Singleton
 class MlKitFaceRecognizer @Inject constructor(
     @ApplicationContext private val context: Context,
@@ -27,32 +35,48 @@ class MlKitFaceRecognizer @Inject constructor(
     // created on first use, inside the background dispatcher below
     private val model: MobileFaceNet by lazy { MobileFaceNet(context) }
 
-    override suspend fun embed(image: FaceImage): Result<FaceEmbedding> = withContext(Dispatchers.Default) {
+    override suspend fun analyze(image: FaceImage): FrameAnalysis = withContext(Dispatchers.Default) {
         try {
             val faces = detector.process(InputImage.fromBitmap(image.bitmap, 0)).await()
-            if (faces.isEmpty()) throw FaceLoginException.NoFace()
-            if (faces.size > 1) throw FaceLoginException.MultipleFaces()
-
-            val face = faces.first()
-            if (abs(face.headEulerAngleY) > MAX_YAW_DEGREES) throw FaceLoginException.TurnedAway()
-
-            val leftEye = face.getLandmark(FaceLandmark.LEFT_EYE)?.position
-            val rightEye = face.getLandmark(FaceLandmark.RIGHT_EYE)?.position
-            if (leftEye == null || rightEye == null) throw FaceLoginException.EyesNotVisible()
-
-            val raw = model.extractEmbedding(image.bitmap, leftEye, rightEye)
-                ?: throw FaceLoginException.EyesNotVisible()
-            Result.success(FaceEmbedding.fromRaw(raw))
+            when {
+                faces.isEmpty() -> FrameAnalysis.NoFace
+                faces.size > 1 -> FrameAnalysis.MultipleFaces(faces.size)
+                else -> analyzeSingleFace(image, faces.first())
+            }
         } catch (e: CancellationException) {
             throw e
-        } catch (e: FaceLoginException) {
-            Result.failure(e)
         } catch (e: Exception) {
-            Result.failure(FaceLoginException.ModelFailure(e))
+            throw FaceLoginException.ModelFailure(e)
         }
     }
 
-    private companion object {
-        const val MAX_YAW_DEGREES = 30f
+    private fun analyzeSingleFace(image: FaceImage, face: com.google.mlkit.vision.face.Face): FrameAnalysis {
+        val left = face.getLandmark(FaceLandmark.LEFT_EYE)?.position
+        val right = face.getLandmark(FaceLandmark.RIGHT_EYE)?.position
+        if (left == null || right == null) return FrameAnalysis.Unusable(FrameIssue.EyesNotVisible)
+
+        if (hypot(left.x - right.x, left.y - right.y) < FaceQualityPolicy.MIN_EYE_DISTANCE_PX) {
+            return FrameAnalysis.Unusable(FrameIssue.TooFar)
+        }
+        if (face.boundingBox.width() > image.bitmap.width * FaceQualityPolicy.MAX_FACE_WIDTH_RATIO) {
+            return FrameAnalysis.Unusable(FrameIssue.TooClose)
+        }
+        if (abs(face.headEulerAngleY) > FaceQualityPolicy.MAX_YAW_DEGREES ||
+            abs(face.headEulerAngleX) > FaceQualityPolicy.MAX_PITCH_DEGREES
+        ) {
+            return FrameAnalysis.Unusable(FrameIssue.TurnedAway)
+        }
+        val leftOpen = face.leftEyeOpenProbability
+        val rightOpen = face.rightEyeOpenProbability
+        // no classification available -> don't block on it
+        if ((leftOpen != null && leftOpen < FaceQualityPolicy.MIN_EYE_OPEN_PROBABILITY) ||
+            (rightOpen != null && rightOpen < FaceQualityPolicy.MIN_EYE_OPEN_PROBABILITY)
+        ) {
+            return FrameAnalysis.Unusable(FrameIssue.EyesClosed)
+        }
+
+        val raw = model.extractEmbedding(image.bitmap, left, right)
+            ?: return FrameAnalysis.Unusable(FrameIssue.EyesNotVisible)
+        return FrameAnalysis.Good(FaceEmbedding.fromRaw(raw))
     }
 }
